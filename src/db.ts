@@ -10,6 +10,7 @@ export type Race = {
   id?: number;
   name: string;
   date: string;
+  endDate?: string;
   distance: string;
   location: string;
   status: "registered" | "completed" | "interested" | "cancelled";

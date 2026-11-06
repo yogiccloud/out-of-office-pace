@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { CalendarDays, CheckCircle2, ChevronDown, ChevronRight, Copy, Download, ExternalLink, Flag, Footprints, Home, Medal, Plus, Search, Trash2, Trophy, Upload, X, Camera, Edit2, MapPin, ShoppingBag, Coffee, Settings, Star, ShieldCheck, Lock, Share, Sparkles, Send } from "lucide-react";
-import { format, parseISO, isBefore, differenceInDays, isValid } from "date-fns";
+import { format, parse, parseISO, isBefore, differenceInDays, isValid } from "date-fns";
 import { db, type ChecklistItem, type Race, type Medal as MedalType } from "./db";
 import { compressImage } from "./imageUtils";
 import { shareToIG } from "./storyUtils";
@@ -13,6 +13,7 @@ type ImportCandidate = {
   race: Omit<Race, "id">;
   updateFields: Partial<Omit<Race, "id">>;
   existingId?: number;
+  existingIds: number[];
   action: ImportAction;
   bookingIdEdited: boolean;
 };
@@ -25,6 +26,12 @@ const fmtDate = (value: string) => {
 const dateKey = (d: string) => d;
 const currentYear = String(new Date().getFullYear());
 const isWrappedSeason = new Date().getMonth() === 11;
+const raceStringFields: Array<keyof Omit<Race, "id">> = [
+  "name", "date", "endDate", "distance", "location", "organizer", "bookingPlatform",
+  "bookingId", "bookingUrl", "bib", "chipTime", "supportCrew", "postRaceMeal",
+  "weatherVibe", "shoes", "watch", "avgPace", "avgHr", "bibImage", "medalImage",
+  "finisherPhoto",
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,11 +55,99 @@ function getImportedString(raw: Record<string, unknown>, ...keys: string[]): str
   return undefined;
 }
 
+function getWindowFromNotes(notes?: string): { startDate: string; endDate: string } | undefined {
+  if (!notes) return undefined;
+  const match = notes.match(/(?:participation|event)\s+window:\s*(\d{1,2}\s+[a-z]+\s+\d{4})\s*[–—-]\s*(\d{1,2}\s+[a-z]+\s+\d{4})/i);
+  if (!match) return undefined;
+  const start = parse(match[1], "d MMMM yyyy", new Date());
+  const end = parse(match[2], "d MMMM yyyy", new Date());
+  if (!isValid(start) || !isValid(end) || end < start) return undefined;
+  return { startDate: format(start, "yyyy-MM-dd"), endDate: format(end, "yyyy-MM-dd") };
+}
+
+function getRaceIdentity(race: Pick<Race, "name" | "date" | "endDate" | "notes">): string {
+  const window = getWindowFromNotes(race.notes);
+  const startDate = window && race.date === window.endDate ? window.startDate : race.date;
+  const name = race.name.trim().toLocaleLowerCase()
+    .replace(/\s*(?:-\s*virtual\s+event|\(virtual\))\s*$/i, "")
+    .replace(/\s+/g, " ");
+  return `${startDate}\u0000${name}`;
+}
+
+function mergeRaceDetails<T extends Partial<Omit<Race, "id">>>(
+  existing: T,
+  incoming: Partial<Omit<Race, "id">>,
+): T & Partial<Omit<Race, "id">> {
+  const merged = { ...existing, ...incoming };
+  for (const field of raceStringFields) {
+    const newValue = incoming[field];
+    if (typeof newValue !== "string" || !newValue.trim()) {
+      const oldValue = existing[field];
+      if (typeof oldValue === "string") Object.assign(merged, { [field]: oldValue });
+    }
+  }
+
+  const notes = [...new Set([existing.notes, incoming.notes]
+    .flatMap(note => note?.split(/\r?\n/) ?? [])
+    .map(note => note.trim())
+    .filter(Boolean))];
+  if (notes.length) merged.notes = notes.join("\n");
+
+  if (existing.status === "completed" && incoming.status === "registered") {
+    merged.status = "completed";
+  }
+
+  if (existing.checklist?.length || incoming.checklist?.length) {
+    const checklist = new Map<string, ChecklistItem>();
+    for (const item of [...(existing.checklist ?? []), ...(incoming.checklist ?? [])]) {
+      const key = item.id || item.text.trim().toLocaleLowerCase();
+      const previous = checklist.get(key);
+      checklist.set(key, previous ? { ...previous, ...item, done: previous.done || item.done } : item);
+    }
+    merged.checklist = [...checklist.values()];
+  }
+
+  return merged;
+}
+
+function getRaceRecordScore(race: Race): number {
+  const populatedFields = raceStringFields.reduce((score, field) =>
+    score + (typeof race[field] === "string" && race[field].trim() ? 1 : 0), 0);
+  return populatedFields
+    + (race.bibImage ? 5 : 0)
+    + (race.medalImage ? 5 : 0)
+    + (race.finisherPhoto ? 5 : 0)
+    + (race.checklist?.length ?? 0);
+}
+
+function formatRaceRange(date: string, endDate?: string): string {
+  if (!endDate || endDate === date) return fmtDate(date);
+  const start = parseISO(date);
+  const end = parseISO(endDate);
+  if (!isValid(start) || !isValid(end)) return `${fmtDate(date)} – ${fmtDate(endDate)}`;
+  if (start.getFullYear() !== end.getFullYear()) {
+    return `${format(start, "MMM dd, yyyy")} – ${format(end, "MMM dd, yyyy")}`;
+  }
+  if (start.getMonth() === end.getMonth()) {
+    return `${format(start, "MMM dd")}–${format(end, "dd, yyyy")}`;
+  }
+  return `${format(start, "MMM dd")} – ${format(end, "MMM dd, yyyy")}`;
+}
+
+function isRacePast(race: Race): boolean {
+  return race.status === "completed" || isBefore(parseISO(race.endDate ?? race.date), parseISO(today));
+}
+
 function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> | null {
   const name = getImportedString(raw, "name", "event_name") ?? "";
-  const date = getImportedString(raw, "date", "start_date")
+  const rawDate = getImportedString(raw, "date", "start_date")
     ?? (/unconfirmed|tba/i.test(String(raw.status ?? "")) ? "2099-12-31" : "");
+  const notes = getImportedString(raw, "notes");
+  const noteWindow = getWindowFromNotes(notes);
+  const date = noteWindow && rawDate === noteWindow.endDate ? noteWindow.startDate : rawDate;
+  const endDate = getImportedString(raw, "endDate", "end_date") ?? noteWindow?.endDate;
   if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !isValid(parseISO(date))) return null;
+  if (endDate && (!/^\d{4}-\d{2}-\d{2}$/.test(endDate) || !isValid(parseISO(endDate)) || endDate < date)) return null;
 
   const status = getImportedStatus(raw.status);
   const amountPaid = raw.amountPaid ?? raw.amount_paid;
@@ -60,6 +155,7 @@ function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> |
   const race: Omit<Race, "id"> = {
     name,
     date,
+    ...(endDate ? { endDate } : {}),
     distance: typeof raw.distance === "string" && raw.distance.trim() ? raw.distance.trim() : "Not specified",
     location: typeof raw.location === "string" ? raw.location.trim() : "",
     status: status ?? "registered",
@@ -69,7 +165,7 @@ function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> |
     ...(typeof amountPaid === "number" && Number.isFinite(amountPaid) ? { amountPaid } : typeof amountPaid === "string" && amountPaid.trim() && Number.isFinite(Number(amountPaid)) ? { amountPaid: Number(amountPaid) } : {}),
     ...(getImportedString(raw, "bookingUrl", "booking_url") ? { bookingUrl: getImportedString(raw, "bookingUrl", "booking_url") } : {}),
     ...(getImportedString(raw, "bib", "bib_number") ? { bib: getImportedString(raw, "bib", "bib_number") } : {}),
-    ...(getImportedString(raw, "notes") ? { notes: getImportedString(raw, "notes") } : {}),
+    ...(notes ? { notes } : {}),
     ...(getImportedString(raw, "chipTime", "chip_time") ? { chipTime: getImportedString(raw, "chipTime", "chip_time") } : {}),
     ...(getImportedString(raw, "supportCrew", "support_crew") ? { supportCrew: getImportedString(raw, "supportCrew", "support_crew") } : {}),
     ...(getImportedString(raw, "postRaceMeal", "post_race_meal") ? { postRaceMeal: getImportedString(raw, "postRaceMeal", "post_race_meal") } : {}),
@@ -90,6 +186,7 @@ function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> |
 
 function getImportUpdateFields(raw: Record<string, unknown>, race: Omit<Race, "id">): Partial<Omit<Race, "id">> {
   const fields: Partial<Omit<Race, "id">> = { name: race.name, date: race.date };
+  if (race.endDate) fields.endDate = race.endDate;
   if (typeof raw.distance === "string" && raw.distance.trim()) fields.distance = race.distance;
   if (typeof raw.location === "string" && raw.location.trim()) fields.location = race.location;
   const status = getImportedStatus(raw.status);
@@ -260,8 +357,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [lightbox]);
 
-  const upcoming = races.filter(r => r.status === "registered" && !isBefore(parseISO(r.date), parseISO(today)));
-  const past = races.filter(r => isBefore(parseISO(r.date), parseISO(today)) || r.status === "completed");
+  const upcoming = races.filter(r => r.status === "registered" && !isRacePast(r));
+  const completedRaces = races.filter(r => r.status === "completed");
   
   // Dashboard Analytics
   const nextRace = upcoming.sort((a, b) => a.date.localeCompare(b.date))[0];
@@ -270,12 +367,12 @@ export default function App() {
   const liveCount = races.length - virtualCount;
   
   const totalKm = useMemo(() => {
-    return races.reduce((km, race) => km + (distanceToKm(race.distance) ?? 0), 0);
+    return races.reduce((km, race) => km + (race.status === "completed" ? distanceToKm(race.distance) ?? 0 : 0), 0);
   }, [races]);
 
   const seasonKm = useMemo(() => {
     return races.reduce((km, race) => {
-      if (race.status !== "completed" || !race.date.startsWith(currentYear)) return km;
+      if (race.status !== "completed" || !(race.endDate ?? race.date).startsWith(currentYear)) return km;
       return km + (distanceToKm(race.distance) ?? 0);
     }, 0);
   }, [races]);
@@ -321,7 +418,7 @@ export default function App() {
   const grouped = useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = races.filter(r => {
-      const isPast = isBefore(parseISO(r.date), parseISO(today)) || r.status === "completed";
+      const isPast = isRacePast(r);
       const matchFilter = filter === "all" || (filter === "past" ? isPast : !isPast);
       const haystack = [r.name, r.location, r.organizer, r.bookingPlatform, r.bookingId, r.bib].join(" ").toLowerCase();
       return matchFilter && (!q || haystack.includes(q));
@@ -400,31 +497,44 @@ export default function App() {
           invalidRows++;
           continue;
         }
-        const normalizedName = race.name.toLocaleLowerCase().replace(/\s+/g, " ");
-        const key = `${race.date}\u0000${normalizedName}`;
+        const key = getRaceIdentity(race);
         const updateFields = getImportUpdateFields(value, race);
         const duplicate = candidatesByKey.get(key);
         if (duplicate) {
-          duplicate.race = { ...duplicate.race, ...updateFields };
-          duplicate.updateFields = { ...duplicate.updateFields, ...updateFields };
+          duplicate.race = mergeRaceDetails(duplicate.race, race);
+          duplicate.updateFields = mergeRaceDetails(duplicate.updateFields, updateFields);
           mergedDuplicates++;
           continue;
         }
 
-        const existing = existingRaces.find(item =>
-          item.date === race.date && item.name.trim().toLocaleLowerCase().replace(/\s+/g, " ") === normalizedName
-        );
         candidatesByKey.set(key, {
           id: `${index}-${race.date}-${race.name}`,
           race,
           updateFields,
-          existingId: existing?.id,
-          action: existing ? "skip" : "import",
+          existingIds: [],
+          action: "import",
           bookingIdEdited: false,
         });
       }
 
-      const candidates = [...candidatesByKey.values()];
+      const candidates = [...candidatesByKey.entries()].map(([key, candidate]) => {
+        const matchingExisting = existingRaces
+          .filter(item => getRaceIdentity(item) === key)
+          .sort((a, b) => getRaceRecordScore(b) - getRaceRecordScore(a));
+        candidate.existingIds = matchingExisting
+          .map(item => item.id)
+          .filter((id): id is number => id !== undefined);
+        candidate.existingId = candidate.existingIds[0];
+        candidate.action = candidate.existingId === undefined ? "import" : "skip";
+
+        const details = matchingExisting.map(({ id: _id, ...race }) => race);
+        const withExistingDetails = details.reduce(
+          (merged, race) => mergeRaceDetails(merged, race),
+          candidate.race,
+        );
+        candidate.race = mergeRaceDetails(withExistingDetails, candidate.race);
+        return candidate;
+      });
       if (candidates.length === 0) {
         alert(`No valid races were found in this file.${invalidRows ? ` ${invalidRows} invalid row(s) were skipped.` : ""}`);
         return;
@@ -443,6 +553,9 @@ export default function App() {
     if (selected.length === 0) return;
     const imported = selected.filter(candidate => candidate.action === "import").length;
     const updated = selected.filter(candidate => candidate.action === "update").length;
+    const consolidated = selected
+      .filter(candidate => candidate.action === "update")
+      .reduce((count, candidate) => count + Math.max(candidate.existingIds.length - 1, 0), 0);
 
     try {
       await db.transaction("rw", db.races, async () => {
@@ -456,9 +569,21 @@ export default function App() {
           }
           const current = await db.races.get(candidate.existingId);
           if (!current) throw new Error(`The existing race for "${candidate.race.name}" no longer exists.`);
-          const updateFields = { ...candidate.updateFields };
-          if (candidate.bookingIdEdited) updateFields.bookingId = candidate.race.bookingId ?? "";
-          await db.races.update(candidate.existingId, updateFields);
+          const existingIds = candidate.existingIds.length ? candidate.existingIds : [candidate.existingId];
+          const otherRecords = await Promise.all(existingIds
+            .filter(id => id !== candidate.existingId)
+            .map(id => db.races.get(id)));
+          let merged: Partial<Omit<Race, "id">> = current;
+          for (const record of otherRecords) {
+            if (!record) continue;
+            const { id: _id, ...details } = record;
+            merged = mergeRaceDetails(merged, details);
+          }
+          merged = mergeRaceDetails(merged, candidate.updateFields);
+          if (candidate.bookingIdEdited) merged.bookingId = candidate.race.bookingId ?? "";
+          await db.races.update(candidate.existingId, merged);
+          const duplicateIds = existingIds.filter(id => id !== candidate.existingId);
+          if (duplicateIds.length) await db.races.bulkDelete(duplicateIds);
         }
       });
     } catch (error) {
@@ -476,7 +601,7 @@ export default function App() {
       return;
     }
     const skipped = candidates.filter(candidate => candidate.action === "skip").length + (importReview?.invalidRows ?? 0);
-    alert(`Import complete: ${imported} added, ${updated} updated, ${skipped} skipped. ${importReview?.mergedDuplicates ?? 0} repeated backup rows merged.`);
+    alert(`Import complete: ${imported} added, ${updated} updated, ${consolidated} duplicate saved race(s) consolidated, ${skipped} skipped. ${importReview?.mergedDuplicates ?? 0} repeated backup row(s) merged.`);
   }
 
   function handleUpgrade(key: string) {
@@ -523,13 +648,13 @@ export default function App() {
           <div className="section-heading"><div><div className="eyebrow">THE BIG PICTURE</div><h2>Your race snapshot</h2></div><span className="muted">{format(new Date(), "EEEE, dd MMM yyyy")}</span></div>
           <div className="stats-grid">
             <Stat label="UPCOMING REGISTRATIONS" value={String(upcoming.length)} unit="RACES" icon={CalendarDays}/>
-            <Stat label="COMPLETED RACES" value={String(past.length)} unit="RACES" icon={Flag}/>
-            <Stat label="TOTAL RACE DISTANCE" value={totalKm > 0 ? String(totalKm) : "--"} unit="KM" icon={MapPin}/>
+            <Stat label="COMPLETED RACES" value={String(completedRaces.length)} unit="RACES" icon={Flag}/>
+            <Stat label="COMPLETED RACE DISTANCE" value={totalKm > 0 ? String(totalKm) : "--"} unit="KM" icon={MapPin}/>
             <Stat label="EVENT TYPES" value={String(liveCount)} unit={`LIVE / ${virtualCount} VIRTUAL`} icon={Trophy}/>
           </div>
           <div className="content-grid"><div className="panel"><div className="panel-heading"><div><div className="eyebrow">YOUR NEXT EVENTS</div><h3>Coming up</h3></div><button className="subtle-link" onClick={() => setTab("races")}>All races <ChevronRight size={15}/></button></div>
             {nextRace && daysToNext !== null && daysToNext >= 0 && <div className="countdown-bar"><b>{daysToNext}</b><span>DAYS UNTIL NEXT RACE</span></div>}
-            {upcoming.length ? upcoming.slice(0,5).map(r => <div className="mini-race" key={r.id}><div className="date-tile"><b>{r.date.startsWith("2099") ? "??" : format(parseISO(r.date), "dd")}</b><span>{r.date.startsWith("2099") ? "TBA" : format(parseISO(r.date), "MMM").toUpperCase()}</span></div><div className="row-main"><b>{r.name}</b><span>{r.location || "Location not added"} · {r.distance}</span></div><span className="status registered">REGISTERED</span></div>) : <div className="chart-empty">No upcoming races yet. Add your first registration.</div>}</div>
+            {upcoming.length ? upcoming.slice(0,5).map(r => <div className="mini-race" key={r.id}><div className="date-tile"><b>{r.date.startsWith("2099") ? "??" : format(parseISO(r.date), "dd")}</b><span>{r.date.startsWith("2099") ? "TBA" : format(parseISO(r.date), "MMM").toUpperCase()}</span></div><div className="row-main"><b>{r.name}</b><span>{formatRaceRange(r.date, r.endDate)} · {r.location || "Location not added"} · {r.distance}</span></div><span className="status registered">REGISTERED</span></div>) : <div className="chart-empty">No upcoming races yet. Add your first registration.</div>}</div>
             <div className="side-panels"><div className="panel sponsor-panel"><div className="sponsor-tag"><Star size={10}/> SAMPLE PARTNER SLOT</div><h3>Featured race partner</h3><p>Example placement only. Replace this card with a real, disclosed sponsor and destination link.</p><a href="https://worldathletics.org/" target="_blank" rel="noreferrer" className="secondary-button small">EXPLORE RUNNING</a></div><div className="panel next-panel"><div className="eyebrow">QUICK ACTION</div><h3>Booked somewhere else?</h3><p>Save the event here with its booking website, confirmation number and payment details so you never lose track.</p><div className="quick-actions"><button className="primary-button small" onClick={() => setModal({kind:"race"})}>ADD DETAILS</button><button type="button" onClick={() => setModal({kind:"import"})}>SMART IMPORT</button></div></div></div></div>
         </div>}
         {tab === "races" && <section className="section-page"><div className="section-heading"><div><div className="eyebrow">YOUR REGISTRATIONS, ALL IN ONE PLACE</div><h1>Race calendar</h1><p>Keep past and upcoming races together — including your Time Capsule photos.</p></div><div className="top-action-group"><button className="secondary-button" onClick={exportRaceCalendarPdf}>{isPro ? <Download size={14}/> : <Lock size={14}/>} EXPORT PDF {isPro && <span className="pro-badge-small">DEMO</span>}</button><button className="primary-button" onClick={() => setModal({kind:"race"})}><Plus size={17}/> ADD RACE</button></div></div>
@@ -591,7 +716,7 @@ function ImportPreviewModal({review, setCandidates, close, confirm}: {
       </div>
       <div className="demo-notice">
         <ShieldCheck size={19}/>
-        <p><b>Review before importing</b><br/>{candidates.length} unique race(s) found. Existing records default to skip. Updates merge the backup’s non-empty details, race memories, and photos; empty fields won’t erase saved data.</p>
+        <p><b>Review before importing</b><br/>{candidates.length} unique race(s) found. Existing records default to skip. Updates merge the backup’s non-empty details, race memories, and photos; when multiple saved entries match one event, choosing merge consolidates them into one entry.</p>
       </div>
       {review.mergedDuplicates > 0 && <p className="import-skipped-note">{review.mergedDuplicates} repeated backup row(s) have been merged, keeping the details and photos they contain.</p>}
       {review.invalidRows > 0 && <p className="import-skipped-note">{review.invalidRows} invalid row(s) will be skipped.</p>}
@@ -602,15 +727,15 @@ function ImportPreviewModal({review, setCandidates, close, confirm}: {
             const duplicate = candidate.existingId !== undefined;
             const hasPhotos = Boolean(candidate.race.bibImage || candidate.race.medalImage || candidate.race.finisherPhoto);
             return <tr key={candidate.id} className={duplicate ? "duplicate-row" : undefined}>
-              <td className="it-date"><b>{format(parseISO(candidate.race.date), "MMM dd")}</b><span>{format(parseISO(candidate.race.date), "yyyy")}</span></td>
+              <td className="it-date"><b>{format(parseISO(candidate.race.date), "MMM dd")}</b><span>{candidate.race.endDate ? formatRaceRange(candidate.race.date, candidate.race.endDate) : format(parseISO(candidate.race.date), "yyyy")}</span></td>
               <td className="it-name"><b>{candidate.race.name}</b><span>{candidate.race.distance} · {candidate.race.location || "Location not provided"}</span></td>
-              <td>{duplicate ? <span className="import-match duplicate">{hasPhotos ? "EXISTS · PHOTOS" : "EXISTS"}</span> : <span className="import-match">{hasPhotos ? "NEW · PHOTOS" : "NEW"}</span>}</td>
+              <td>{duplicate ? <span className="import-match duplicate">{candidate.existingIds.length > 1 ? `EXISTS · ${candidate.existingIds.length} RECORDS` : "EXISTS"}{hasPhotos ? " · PHOTOS" : ""}</span> : <span className="import-match">{hasPhotos ? "NEW · PHOTOS" : "NEW"}</span>}</td>
               <td><input className="import-booking-id" aria-label={`Booking ID for ${candidate.race.name}`} value={candidate.race.bookingId ?? ""} onChange={event => updateCandidate(candidate.id, {
                 race: { ...candidate.race, bookingId: event.target.value },
                 bookingIdEdited: true,
               })}/></td>
               <td><select aria-label={`Import action for ${candidate.race.name}`} value={candidate.action} disabled={busy} onChange={event => updateCandidate(candidate.id, { action: event.target.value as ImportAction })}>
-                {duplicate ? <><option value="skip">Skip · keep existing</option><option value="update">Merge backup details</option></> : <><option value="import">Import as new</option><option value="skip">Skip</option></>}
+                {duplicate ? <><option value="skip">Skip · keep existing</option><option value="update">{candidate.existingIds.length > 1 ? "Merge details + duplicates" : "Merge backup details"}</option></> : <><option value="import">Import as new</option><option value="skip">Skip</option></>}
               </select></td>
             </tr>;
           })}</tbody>
@@ -658,7 +783,7 @@ function Onboarding({close}: {close: () => void}) {
 }
 
 function WrappedModal({races, medals, close}: {races: Race[]; medals: MedalType[]; close: () => void}) {
-  const yearRaces = races.filter(race => race.status === "completed" && race.date.startsWith(currentYear));
+  const yearRaces = races.filter(race => race.status === "completed" && (race.endDate ?? race.date).startsWith(currentYear));
   const yearMedals = medals.filter(medal => medal.date.startsWith(currentYear));
   const yearKm = yearRaces.reduce((total, race) => total + (distanceToKm(race.distance) ?? 0), 0);
 
@@ -696,7 +821,7 @@ function RaceCard({race:r, onEdit, onDelete, onImageClick, onToggleChecklist}: {
   const [vaultOpen, setVaultOpen] = useState(false);
   const hasMemories = Boolean(r.chipTime || r.supportCrew || r.postRaceMeal || r.weatherVibe || r.shoes || r.watch || r.avgPace || r.avgHr || r.bibImage || r.medalImage || r.finisherPhoto);
 
-  return <div className="race-card"><div className="race-card-main"><div className="race-title-line"><b>{r.name}</b><span className={`status ${r.status}`}>{r.status}</span></div><div className="race-meta">{r.distance} {r.location ? `· ${r.location}` : ""} {r.organizer ? `· Organiser: ${r.organizer}` : ""}</div><div className="booking-grid">{r.bookingPlatform && <span><small>BOOKED VIA</small><b>{r.bookingPlatform}</b></span>}{r.bookingId && <span><small>BOOKING / ORDER ID</small><b>{r.bookingId}</b></span>}{r.bib && <span><small>BIB NUMBER</small><b>{r.bib}</b></span>}{r.amountPaid !== undefined && <span><small>AMOUNT PAID</small><b>₹{r.amountPaid.toLocaleString("en-IN")}</b></span>}</div>{r.notes && <p className="race-notes">{r.notes}</p>}
+  return <div className="race-card"><div className="race-card-main"><div className="race-title-line"><b>{r.name}</b><span className={`status ${r.status}`}>{r.status}</span></div><div className="race-meta">{r.endDate && r.endDate !== r.date ? `${formatRaceRange(r.date, r.endDate)} · ` : ""}{r.distance} {r.location ? `· ${r.location}` : ""} {r.organizer ? `· Organiser: ${r.organizer}` : ""}</div><div className="booking-grid">{r.bookingPlatform && <span><small>BOOKED VIA</small><b>{r.bookingPlatform}</b></span>}{r.bookingId && <span><small>BOOKING / ORDER ID</small><b>{r.bookingId}</b></span>}{r.bib && <span><small>BIB NUMBER</small><b>{r.bib}</b></span>}{r.amountPaid !== undefined && <span><small>AMOUNT PAID</small><b>₹{r.amountPaid.toLocaleString("en-IN")}</b></span>}</div>{r.notes && <p className="race-notes">{r.notes}</p>}
     {r.status === "registered" && Boolean(r.checklist?.length) && <div className="card-checklist"><div className="form-divider">PRE-RACE CHECKLIST</div>{r.checklist!.map(item => <label key={item.id} className="checklist-item-display"><input type="checkbox" checked={item.done} onChange={event => onToggleChecklist(item.id, event.target.checked)}/><span className={item.done ? "done" : ""}>{item.text}</span></label>)}</div>}
     {r.status === "completed" && hasMemories && <>
       <div className="vault-toggle-container">
@@ -753,12 +878,13 @@ function Modal({kind, initialData, close, openImport, saved, exportData, importD
     }
   }
 
-  const geminiPrompt = `Act as a JSON data extractor. Read my recent race confirmation emails and output ONLY a valid JSON object with a "races" array, matching this exact schema: { "name": "Race Name", "date": "YYYY-MM-DD", "distance": "5K", "location": "City or Virtual", "status": "registered", "bookingPlatform": "App name", "bookingId": "12345" }. Do not use markdown.`;
+  const geminiPrompt = `Act as a JSON data extractor. Read my recent race confirmation emails and output ONLY a valid JSON object with a "races" array, matching this exact schema: { "name": "Race Name", "date": "YYYY-MM-DD", "endDate": "YYYY-MM-DD or omit for one-day events", "distance": "5K", "location": "City or Virtual", "status": "registered", "bookingPlatform": "App name", "bookingId": "12345" }. Use one race object per registration. For multi-day virtual events, put the participation window's first day in "date" and its last day in "endDate"; do not create one race object per day. Do not use markdown.`;
   const jsonTemplate = `{
   "races": [
     {
       "name": "Event Name",
       "date": "2026-12-31",
+      "endDate": "2027-01-02",
       "distance": "10K",
       "location": "City",
       "status": "registered"
@@ -782,6 +908,10 @@ function Modal({kind, initialData, close, openImport, saved, exportData, importD
     e.preventDefault(); setBusy(true);
     try {
       if (kind === "race") {
+        if (form.endDate && form.endDate < form.date) {
+          alert("The end date must be on or after the start date.");
+          return;
+        }
         const payload = { ...form, amountPaid: form.amountPaid === "" || form.amountPaid === undefined ? undefined : Number(form.amountPaid) };
         if (isEdit) await db.races.update(initialData.id, payload);
         else await db.races.add(payload);
@@ -825,7 +955,7 @@ function Modal({kind, initialData, close, openImport, saved, exportData, importD
         <button type="button" className="secondary-button wizard-back" onClick={() => setImportFlow("choose")}>BACK</button>
       </div>}
     </div> : <form onSubmit={submit}>
-    {kind==="race" && <><Field label="Race / event name" name="name" value={form.name||""} onChange={change} placeholder="e.g. Bengaluru 10K" required/><div className="form-grid"><Field label="Race date" name="date" type="date" value={form.date||""} onChange={change} required/><Field label="Distance" name="distance" value={form.distance||""} onChange={change} placeholder="5K / 10K / HM"/></div><Field label="City / venue" name="location" value={form.location||""} onChange={change} placeholder="e.g. Bengaluru · Begur Lake"/><div className="form-grid"><Field label="Organiser" name="organizer" value={form.organizer||""} onChange={change} placeholder="Event organiser"/><label className="field"><span>Race status</span><select name="status" value={form.status||"registered"} onChange={change}><option value="registered">Registered / Paid</option><option value="interested">Interested / Not booked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select></label></div>
+    {kind==="race" && <><Field label="Race / event name" name="name" value={form.name||""} onChange={change} placeholder="e.g. Bengaluru 10K" required/><div className="form-grid"><Field label="Start date" name="date" type="date" value={form.date||""} onChange={change} required/><Field label="End date (optional)" name="endDate" type="date" min={form.date || undefined} value={form.endDate||""} onChange={change}/></div><div className="form-grid"><Field label="Distance" name="distance" value={form.distance||""} onChange={change} placeholder="5K / 10K / HM"/><Field label="City / venue" name="location" value={form.location||""} onChange={change} placeholder="e.g. Bengaluru · Begur Lake"/></div><div className="form-grid"><Field label="Organiser" name="organizer" value={form.organizer||""} onChange={change} placeholder="Event organiser"/><label className="field"><span>Race status</span><select name="status" value={form.status||"registered"} onChange={change}><option value="registered">Registered / Paid</option><option value="interested">Interested / Not booked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select></label></div>
       <div className="form-divider">BOOKING INFORMATION</div>
       <div className="form-grid"><Field label="Booked through" name="bookingPlatform" value={form.bookingPlatform||""} onChange={change} placeholder="e.g. Townscript"/><Field label="Booking ID" name="bookingId" value={form.bookingId||""} onChange={change} placeholder="Confirmation no."/></div><div className="form-grid"><Field label="Amount paid (₹)" name="amountPaid" type="number" step="0.01" value={form.amountPaid??""} onChange={change}/><Field label="BIB number" name="bib" value={form.bib||""} onChange={change}/></div><Field label="Booking confirmation URL" name="bookingUrl" type="url" value={form.bookingUrl||""} onChange={change} placeholder="https://…"/><Field label="Notes / reminders" name="notes" type="textarea" value={form.notes||""} onChange={change} placeholder="Kit collection details..." />
       
