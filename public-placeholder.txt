@@ -1,0 +1,1 @@
+The PWA icons are created as SVG files in the public folder when you unzip the project. See README.md.
