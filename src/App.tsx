@@ -16,7 +16,7 @@ type ImportCandidate = {
   action: ImportAction;
   bookingIdEdited: boolean;
 };
-type ImportReview = { candidates: ImportCandidate[]; skippedRows: number };
+type ImportReview = { candidates: ImportCandidate[]; invalidRows: number; mergedDuplicates: number };
 const today = new Date().toISOString().slice(0, 10);
 const fmtDate = (value: string) => { 
   if (value.startsWith("2099")) return "TBA";
@@ -30,46 +30,60 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isRaceStatus(value: unknown): value is Race["status"] {
-  return value === "registered" || value === "completed" || value === "interested" || value === "cancelled";
+function getImportedStatus(value: unknown): Race["status"] | undefined {
+  if (typeof value !== "string") return undefined;
+  const status = value.trim().toLocaleLowerCase();
+  if (status === "completed") return "completed";
+  if (status === "registered" || status === "upcoming" || status === "paid") return "registered";
+  if (status === "interested" || status === "not booked") return "interested";
+  if (status === "cancelled" || status === "canceled") return "cancelled";
+  return undefined;
+}
+
+function getImportedString(raw: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
 }
 
 function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> | null {
-  const name = typeof raw.name === "string" ? raw.name.trim()
-    : typeof raw.event_name === "string" ? raw.event_name.trim()
-    : "";
-  const date = typeof raw.date === "string" ? raw.date
-    : typeof raw.start_date === "string" ? raw.start_date
-    : "";
+  const name = getImportedString(raw, "name", "event_name") ?? "";
+  const date = getImportedString(raw, "date", "start_date")
+    ?? (/unconfirmed|tba/i.test(String(raw.status ?? "")) ? "2099-12-31" : "");
   if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !isValid(parseISO(date))) return null;
 
+  const status = getImportedStatus(raw.status);
+  const amountPaid = raw.amountPaid ?? raw.amount_paid;
+  const checklist = raw.checklist;
   const race: Omit<Race, "id"> = {
     name,
     date,
     distance: typeof raw.distance === "string" && raw.distance.trim() ? raw.distance.trim() : "Not specified",
     location: typeof raw.location === "string" ? raw.location.trim() : "",
-    status: isRaceStatus(raw.status) ? raw.status : "registered",
-    ...(typeof raw.organizer === "string" ? { organizer: raw.organizer } : {}),
-    ...(typeof raw.bookingPlatform === "string" ? { bookingPlatform: raw.bookingPlatform } : {}),
-    ...(typeof raw.bookingId === "string" ? { bookingId: raw.bookingId } : {}),
-    ...(typeof raw.amountPaid === "number" && Number.isFinite(raw.amountPaid) ? { amountPaid: raw.amountPaid } : {}),
-    ...(typeof raw.bookingUrl === "string" ? { bookingUrl: raw.bookingUrl } : {}),
-    ...(typeof raw.bib === "string" ? { bib: raw.bib } : {}),
-    ...(typeof raw.notes === "string" ? { notes: raw.notes } : {}),
-    ...(typeof raw.chipTime === "string" ? { chipTime: raw.chipTime } : {}),
-    ...(typeof raw.supportCrew === "string" ? { supportCrew: raw.supportCrew } : {}),
-    ...(typeof raw.postRaceMeal === "string" ? { postRaceMeal: raw.postRaceMeal } : {}),
-    ...(typeof raw.weatherVibe === "string" ? { weatherVibe: raw.weatherVibe } : {}),
-    ...(typeof raw.shoes === "string" ? { shoes: raw.shoes } : {}),
-    ...(typeof raw.watch === "string" ? { watch: raw.watch } : {}),
-    ...(typeof raw.avgPace === "string" ? { avgPace: raw.avgPace } : {}),
-    ...(typeof raw.avgHr === "string" ? { avgHr: raw.avgHr } : {}),
-    ...(typeof raw.bibImage === "string" ? { bibImage: raw.bibImage } : {}),
-    ...(typeof raw.medalImage === "string" ? { medalImage: raw.medalImage } : {}),
-    ...(typeof raw.finisherPhoto === "string" ? { finisherPhoto: raw.finisherPhoto } : {}),
-    ...(Array.isArray(raw.checklist) && raw.checklist.every(item =>
+    status: status ?? "registered",
+    ...(getImportedString(raw, "organizer", "organiser") ? { organizer: getImportedString(raw, "organizer", "organiser") } : {}),
+    ...(getImportedString(raw, "bookingPlatform", "booking_platform") ? { bookingPlatform: getImportedString(raw, "bookingPlatform", "booking_platform") } : {}),
+    ...(getImportedString(raw, "bookingId", "booking_id", "registration_id") ? { bookingId: getImportedString(raw, "bookingId", "booking_id", "registration_id") } : {}),
+    ...(typeof amountPaid === "number" && Number.isFinite(amountPaid) ? { amountPaid } : typeof amountPaid === "string" && amountPaid.trim() && Number.isFinite(Number(amountPaid)) ? { amountPaid: Number(amountPaid) } : {}),
+    ...(getImportedString(raw, "bookingUrl", "booking_url") ? { bookingUrl: getImportedString(raw, "bookingUrl", "booking_url") } : {}),
+    ...(getImportedString(raw, "bib", "bib_number") ? { bib: getImportedString(raw, "bib", "bib_number") } : {}),
+    ...(getImportedString(raw, "notes") ? { notes: getImportedString(raw, "notes") } : {}),
+    ...(getImportedString(raw, "chipTime", "chip_time") ? { chipTime: getImportedString(raw, "chipTime", "chip_time") } : {}),
+    ...(getImportedString(raw, "supportCrew", "support_crew") ? { supportCrew: getImportedString(raw, "supportCrew", "support_crew") } : {}),
+    ...(getImportedString(raw, "postRaceMeal", "post_race_meal") ? { postRaceMeal: getImportedString(raw, "postRaceMeal", "post_race_meal") } : {}),
+    ...(getImportedString(raw, "weatherVibe", "weather_vibe") ? { weatherVibe: getImportedString(raw, "weatherVibe", "weather_vibe") } : {}),
+    ...(getImportedString(raw, "shoes") ? { shoes: getImportedString(raw, "shoes") } : {}),
+    ...(getImportedString(raw, "watch") ? { watch: getImportedString(raw, "watch") } : {}),
+    ...(getImportedString(raw, "avgPace", "avg_pace") ? { avgPace: getImportedString(raw, "avgPace", "avg_pace") } : {}),
+    ...(getImportedString(raw, "avgHr", "avg_hr") ? { avgHr: getImportedString(raw, "avgHr", "avg_hr") } : {}),
+    ...(getImportedString(raw, "bibImage", "bib_image") ? { bibImage: getImportedString(raw, "bibImage", "bib_image") } : {}),
+    ...(getImportedString(raw, "medalImage", "medal_image") ? { medalImage: getImportedString(raw, "medalImage", "medal_image") } : {}),
+    ...(getImportedString(raw, "finisherPhoto", "finisher_photo") ? { finisherPhoto: getImportedString(raw, "finisherPhoto", "finisher_photo") } : {}),
+    ...(Array.isArray(checklist) && checklist.every(item =>
       isRecord(item) && typeof item.id === "string" && typeof item.text === "string" && typeof item.done === "boolean"
-    ) ? { checklist: raw.checklist as ChecklistItem[] } : {}),
+    ) ? { checklist: checklist as ChecklistItem[] } : {}),
   };
   return race;
 }
@@ -77,14 +91,39 @@ function normalizeImportedRace(raw: Record<string, unknown>): Omit<Race, "id"> |
 function getImportUpdateFields(raw: Record<string, unknown>, race: Omit<Race, "id">): Partial<Omit<Race, "id">> {
   const fields: Partial<Omit<Race, "id">> = { name: race.name, date: race.date };
   if (typeof raw.distance === "string" && raw.distance.trim()) fields.distance = race.distance;
-  if (typeof raw.location === "string") fields.location = race.location;
-  if (isRaceStatus(raw.status)) fields.status = race.status;
-  if (typeof raw.organizer === "string" && raw.organizer.trim()) fields.organizer = raw.organizer;
-  if (typeof raw.bookingPlatform === "string" && raw.bookingPlatform.trim()) fields.bookingPlatform = raw.bookingPlatform;
-  if (typeof raw.bookingId === "string" && raw.bookingId.trim()) fields.bookingId = raw.bookingId;
-  if (typeof raw.amountPaid === "number" && Number.isFinite(raw.amountPaid)) fields.amountPaid = raw.amountPaid;
-  if (typeof raw.bookingUrl === "string" && raw.bookingUrl.trim()) fields.bookingUrl = raw.bookingUrl;
-  if (typeof raw.bib === "string" && raw.bib.trim()) fields.bib = raw.bib;
+  if (typeof raw.location === "string" && raw.location.trim()) fields.location = race.location;
+  const status = getImportedStatus(raw.status);
+  if (status) fields.status = status;
+  const stringFields: Array<[keyof Omit<Race, "id">, string | undefined]> = [
+    ["organizer", getImportedString(raw, "organizer", "organiser")],
+    ["bookingPlatform", getImportedString(raw, "bookingPlatform", "booking_platform")],
+    ["bookingId", getImportedString(raw, "bookingId", "booking_id", "registration_id")],
+    ["bookingUrl", getImportedString(raw, "bookingUrl", "booking_url")],
+    ["bib", getImportedString(raw, "bib", "bib_number")],
+    ["notes", getImportedString(raw, "notes")],
+    ["chipTime", getImportedString(raw, "chipTime", "chip_time")],
+    ["supportCrew", getImportedString(raw, "supportCrew", "support_crew")],
+    ["postRaceMeal", getImportedString(raw, "postRaceMeal", "post_race_meal")],
+    ["weatherVibe", getImportedString(raw, "weatherVibe", "weather_vibe")],
+    ["shoes", getImportedString(raw, "shoes")],
+    ["watch", getImportedString(raw, "watch")],
+    ["avgPace", getImportedString(raw, "avgPace", "avg_pace")],
+    ["avgHr", getImportedString(raw, "avgHr", "avg_hr")],
+    ["bibImage", getImportedString(raw, "bibImage", "bib_image")],
+    ["medalImage", getImportedString(raw, "medalImage", "medal_image")],
+    ["finisherPhoto", getImportedString(raw, "finisherPhoto", "finisher_photo")],
+  ];
+  for (const [field, value] of stringFields) {
+    if (value) Object.assign(fields, { [field]: value });
+  }
+
+  const amountPaid = raw.amountPaid ?? raw.amount_paid;
+  if (typeof amountPaid === "number" && Number.isFinite(amountPaid)) fields.amountPaid = amountPaid;
+  else if (typeof amountPaid === "string" && amountPaid.trim() && Number.isFinite(Number(amountPaid))) fields.amountPaid = Number(amountPaid);
+
+  if (Array.isArray(raw.checklist) && raw.checklist.every(item =>
+    isRecord(item) && typeof item.id === "string" && typeof item.text === "string" && typeof item.done === "boolean"
+  )) fields.checklist = raw.checklist as ChecklistItem[];
   return fields;
 }
 
@@ -347,47 +386,51 @@ export default function App() {
       }
 
       const existingRaces = await db.races.toArray();
-      const candidates: ImportCandidate[] = [];
-      const seen = new Set<string>();
-      let skippedRows = 0;
+      const candidatesByKey = new Map<string, ImportCandidate>();
+      let invalidRows = 0;
+      let mergedDuplicates = 0;
 
       for (const [index, value] of data.races.entries()) {
         if (!isRecord(value)) {
-          skippedRows++;
+          invalidRows++;
           continue;
         }
         const race = normalizeImportedRace(value);
         if (!race) {
-          skippedRows++;
+          invalidRows++;
           continue;
         }
         const normalizedName = race.name.toLocaleLowerCase().replace(/\s+/g, " ");
         const key = `${race.date}\u0000${normalizedName}`;
-        if (seen.has(key)) {
-          skippedRows++;
+        const updateFields = getImportUpdateFields(value, race);
+        const duplicate = candidatesByKey.get(key);
+        if (duplicate) {
+          duplicate.race = { ...duplicate.race, ...updateFields };
+          duplicate.updateFields = { ...duplicate.updateFields, ...updateFields };
+          mergedDuplicates++;
           continue;
         }
-        seen.add(key);
 
         const existing = existingRaces.find(item =>
           item.date === race.date && item.name.trim().toLocaleLowerCase().replace(/\s+/g, " ") === normalizedName
         );
-        candidates.push({
+        candidatesByKey.set(key, {
           id: `${index}-${race.date}-${race.name}`,
           race,
-          updateFields: getImportUpdateFields(value, race),
+          updateFields,
           existingId: existing?.id,
           action: existing ? "skip" : "import",
           bookingIdEdited: false,
         });
       }
 
+      const candidates = [...candidatesByKey.values()];
       if (candidates.length === 0) {
-        alert(`No valid races were found in this file.${skippedRows ? ` ${skippedRows} row(s) were skipped.` : ""}`);
+        alert(`No valid races were found in this file.${invalidRows ? ` ${invalidRows} invalid row(s) were skipped.` : ""}`);
         return;
       }
 
-      setImportReview({ candidates, skippedRows });
+      setImportReview({ candidates, invalidRows, mergedDuplicates });
       setModal(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error.";
@@ -432,8 +475,8 @@ export default function App() {
       alert(`Import saved, but the race list could not be refreshed. Reload the page to see the changes. ${message}`);
       return;
     }
-    const skipped = candidates.filter(candidate => candidate.action === "skip").length + (importReview?.skippedRows ?? 0);
-    alert(`Import complete: ${imported} added, ${updated} updated, ${skipped} skipped.`);
+    const skipped = candidates.filter(candidate => candidate.action === "skip").length + (importReview?.invalidRows ?? 0);
+    alert(`Import complete: ${imported} added, ${updated} updated, ${skipped} skipped. ${importReview?.mergedDuplicates ?? 0} repeated backup rows merged.`);
   }
 
   function handleUpgrade(key: string) {
@@ -548,24 +591,26 @@ function ImportPreviewModal({review, setCandidates, close, confirm}: {
       </div>
       <div className="demo-notice">
         <ShieldCheck size={19}/>
-        <p><b>Review before importing</b><br/>{candidates.length} race(s) found. Existing records default to skip. Updates change race and booking details only; saved notes, photos, and checklist memories are kept.</p>
+        <p><b>Review before importing</b><br/>{candidates.length} unique race(s) found. Existing records default to skip. Updates merge the backup’s non-empty details, race memories, and photos; empty fields won’t erase saved data.</p>
       </div>
-      {review.skippedRows > 0 && <p className="import-skipped-note">{review.skippedRows} invalid or repeated row(s) will be skipped.</p>}
+      {review.mergedDuplicates > 0 && <p className="import-skipped-note">{review.mergedDuplicates} repeated backup row(s) have been merged, keeping the details and photos they contain.</p>}
+      {review.invalidRows > 0 && <p className="import-skipped-note">{review.invalidRows} invalid row(s) will be skipped.</p>}
       <div className="import-table-container">
         <table className="import-table">
           <thead><tr><th scope="col">DATE</th><th scope="col">RACE</th><th scope="col">MATCH</th><th scope="col">BOOKING ID</th><th scope="col">ACTION</th></tr></thead>
           <tbody>{candidates.map(candidate => {
             const duplicate = candidate.existingId !== undefined;
+            const hasPhotos = Boolean(candidate.race.bibImage || candidate.race.medalImage || candidate.race.finisherPhoto);
             return <tr key={candidate.id} className={duplicate ? "duplicate-row" : undefined}>
               <td className="it-date"><b>{format(parseISO(candidate.race.date), "MMM dd")}</b><span>{format(parseISO(candidate.race.date), "yyyy")}</span></td>
               <td className="it-name"><b>{candidate.race.name}</b><span>{candidate.race.distance} · {candidate.race.location || "Location not provided"}</span></td>
-              <td>{duplicate ? <span className="import-match duplicate">EXISTS</span> : <span className="import-match">NEW</span>}</td>
+              <td>{duplicate ? <span className="import-match duplicate">{hasPhotos ? "EXISTS · PHOTOS" : "EXISTS"}</span> : <span className="import-match">{hasPhotos ? "NEW · PHOTOS" : "NEW"}</span>}</td>
               <td><input className="import-booking-id" aria-label={`Booking ID for ${candidate.race.name}`} value={candidate.race.bookingId ?? ""} onChange={event => updateCandidate(candidate.id, {
                 race: { ...candidate.race, bookingId: event.target.value },
                 bookingIdEdited: true,
               })}/></td>
               <td><select aria-label={`Import action for ${candidate.race.name}`} value={candidate.action} disabled={busy} onChange={event => updateCandidate(candidate.id, { action: event.target.value as ImportAction })}>
-                {duplicate ? <><option value="skip">Skip · keep existing</option><option value="update">Update details</option></> : <><option value="import">Import as new</option><option value="skip">Skip</option></>}
+                {duplicate ? <><option value="skip">Skip · keep existing</option><option value="update">Merge backup details</option></> : <><option value="import">Import as new</option><option value="skip">Skip</option></>}
               </select></td>
             </tr>;
           })}</tbody>
